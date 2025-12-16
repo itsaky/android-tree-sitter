@@ -165,7 +165,7 @@ fun Project.configureTsModule() {
       logger.lifecycle("Set namespace '$namespace' to $project")
     }
 
-    ndkVersion = "24.0.8215888"
+    ndkVersion = "29.0.14206865"
 
     defaultConfig {
       val rootProjDir = project.rootProject.projectDir.absolutePath

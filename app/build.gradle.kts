@@ -70,6 +70,8 @@ dependencies {
     implementation(libs.google.material)
 
     implementation(projects.androidTreeSitter)
+    implementation(projects.treeSitterC)
+    implementation(projects.treeSitterCpp)
     implementation(projects.treeSitterJava)
     implementation(projects.treeSitterJson)
     implementation(projects.treeSitterKotlin)
