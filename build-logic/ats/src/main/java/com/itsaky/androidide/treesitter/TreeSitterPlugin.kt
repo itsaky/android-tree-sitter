@@ -102,8 +102,6 @@ class TreeSitterPlugin : Plugin<Project> {
       @Suppress("DEPRECATION")
       val ndkPlatform = dslServices.sdkComponents.map {
         it.versionedNdkHandler(
-          baseExtention.compileSdkVersion ?: throw kotlin.IllegalStateException(
-            "compileSdkVersion not set in the android configuration"),
           baseExtention.ndkVersion,
           baseExtention.ndkPath).ndkPlatform.getOrThrow()
       }

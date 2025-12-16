@@ -18,6 +18,7 @@
 package com.itsaky.androidide.treesitter
 
 import com.android.build.gradle.internal.core.Abi
+import com.android.build.gradle.internal.cxx.configure.architecture
 import com.android.build.gradle.internal.ndk.NdkInfo
 import org.gradle.api.DefaultTask
 import org.gradle.api.file.DirectoryProperty
@@ -74,7 +75,7 @@ abstract class GenerateDebugSymbolsTask : DefaultTask() {
       }
     }
 
-    val objcopyExe = ndkInfo.get().getObjcopyExecutable(abi)
+    val objcopyExe = ndkInfo.get().getObjcopyExecutable(abi.architecture)
     val cmdLine = arrayOf(
       objcopyExe.absolutePath,
       "--only-keep-debug",

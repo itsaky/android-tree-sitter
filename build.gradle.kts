@@ -25,7 +25,6 @@ import com.vanniktech.maven.publish.AndroidSingleVariantLibrary
 import com.vanniktech.maven.publish.JavaLibrary
 import com.vanniktech.maven.publish.JavadocJar
 import com.vanniktech.maven.publish.MavenPublishBaseExtension
-import com.vanniktech.maven.publish.SonatypeHost
 
 buildscript {
   dependencies {
@@ -135,7 +134,7 @@ subprojects {
       }
 
       coordinates(project.group.toString(), project.name, versionName)
-      publishToMavenCentral(host = SonatypeHost.S01)
+      publishToMavenCentral()
       signAllPublications()
       if (plugins.hasPlugin("java-library")) {
         configure(
