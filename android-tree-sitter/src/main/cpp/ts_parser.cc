@@ -16,6 +16,7 @@
  */
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <iostream>
 
@@ -35,19 +36,14 @@ class TSParserInternal {
  public:
 
   TSParserInternal() {
-    cancellation_flag_mutex = new std::mutex();
-    cancellation_flag = new std::atomic<size_t *>(nullptr);
     parser = ts_parser_new();
   }
 
   ~TSParserInternal() {
-    delete cancellation_flag_mutex;
-    delete cancellation_flag;
-    ts_parser_delete(parser);
-
-    cancellation_flag_mutex = nullptr;
-    cancellation_flag = nullptr;
-    parser = nullptr;
+    if (parser != nullptr) {
+      ts_parser_delete(parser);
+      parser = nullptr;
+    }
   }
 
   TSParser *getParser(JNIEnv *env) {
@@ -58,8 +54,15 @@ class TSParserInternal {
     return this->parser;
   }
 
-  bool begin_round(JNIEnv *env) {
-    auto flag = get_cancellation_flag(env);
+    bool begin_round(JNIEnv *env) {
+    std::unique_lock<std::mutex> lock(cancellation_flag_mutex);
+
+    if (parser == nullptr || closing) {
+      throw_illegal_state(env, "TSParserInternal has already been closed");
+      return false;
+    }
+
+    auto flag = cancellation_flag.load();
 
     if (flag) {
       throw_illegal_state(env,
@@ -68,24 +71,60 @@ class TSParserInternal {
     }
 
     // allocate a new cancellation flag
-    flag = (size_t *) malloc(sizeof(int));
-    set_cancellation_flag(env, flag);
+    flag = (size_t *) malloc(sizeof(size_t));
 
     // set the cancellation flag to '0' to indicate that the parser should continue parsing
     *flag = 0;
-    ts_parser_set_cancellation_flag(getParser(env), flag);
+
+    cancellation_flag.store(flag);
+    parsing = true;
+
+    ts_parser_set_cancellation_flag(parser, flag);
 
     return true;
   }
 
   void end_round(JNIEnv *env) {
+    std::unique_lock<std::mutex> lock(cancellation_flag_mutex);
 
-    size_t *flag = get_cancellation_flag(env);
+    if (parser == nullptr) {
+      return;
+    }
 
-    // release the cancellation flag
-    free((size_t *) flag);
-    set_cancellation_flag(env, nullptr);
-    ts_parser_set_cancellation_flag(getParser(env), nullptr);
+    auto flag = cancellation_flag.load();
+
+    ts_parser_set_cancellation_flag(parser, nullptr);
+    cancellation_flag.store(nullptr);
+    parsing = false;
+
+    if (flag != nullptr) {
+      free(flag);
+    }
+
+    lock.unlock();
+    parse_condition.notify_all();
+  }
+  
+  bool request_cancellation(JNIEnv *env) {
+    std::lock_guard<std::mutex> lock(cancellation_flag_mutex);
+
+    if (parser == nullptr || closing) {
+      return false;
+    }
+
+    auto flag = cancellation_flag.load();
+
+    if (flag == nullptr) {
+      LOGD("TSParser",
+           "Cannot cancel parsing, no parse is in progress (cancellation flag is nullptr).");
+      return false;
+    }
+
+    *flag = 1;
+
+    LOGD("TSParser", "Cancellation flag has been set");
+
+    return true;
   }
 
   size_t *get_cancellation_flag(JNIEnv *env) {
@@ -93,8 +132,8 @@ class TSParserInternal {
       return nullptr;
     }
 
-    std::lock_guard<std::mutex> get_lock(*cancellation_flag_mutex);
-    return cancellation_flag->load();
+    std::lock_guard<std::mutex> get_lock(cancellation_flag_mutex);
+    return cancellation_flag.load();
   }
 
   void set_cancellation_flag(JNIEnv *env, size_t *flag) {
@@ -102,19 +141,53 @@ class TSParserInternal {
       return;
     }
 
-    std::lock_guard<std::mutex> set_lock(*cancellation_flag_mutex);
-    cancellation_flag->store(flag);
+    std::lock_guard<std::mutex> set_lock(cancellation_flag_mutex);
+    cancellation_flag.store(flag);
+  } 
+
+  void close(JNIEnv *env) {
+    std::unique_lock<std::mutex> lock(cancellation_flag_mutex);
+
+    if (parser == nullptr) {
+      return;
+    }
+
+    closing = true;
+
+    auto flag = cancellation_flag.load();
+
+    if (flag != nullptr) {
+      *flag = 1;
+    }
+
+    parse_condition.wait(lock, [this]() {
+      return !parsing;
+    });
+
+    ts_parser_set_cancellation_flag(parser, nullptr);
+
+    flag = cancellation_flag.load();
+    cancellation_flag.store(nullptr);
+
+    if (flag != nullptr) {
+      free(flag);
+    }
+
+    ts_parser_delete(parser);
+    parser = nullptr;
   }
 
  private:
-  std::mutex *cancellation_flag_mutex;
-  std::atomic<size_t *> *cancellation_flag;
+  std::mutex cancellation_flag_mutex;
+  std::atomic<size_t *> cancellation_flag{nullptr};
+  std::condition_variable parse_condition;
+  bool parsing = false;
+  bool closing = false;
 
   TSParser *parser;
 
   bool check_destroyed(JNIEnv *env) {
-    if (cancellation_flag_mutex == nullptr || cancellation_flag == nullptr
-        || parser == nullptr) {
+    if (cancellation_flag.load() == nullptr && parser == nullptr) {
       throw_illegal_state(env, "TSParserInternal has already been destroyed");
       return true;
     }
@@ -137,7 +210,8 @@ TSParser_delete(JNIEnv *env,
   req_nnp(env, parser_ptr);
 
   auto parser = (TSParserInternal *) parser_ptr;
-  delete parser;
+
+  parser->close(env);
 }
 
 static void
@@ -237,29 +311,43 @@ static jlong TSParser_parse(JNIEnv *env,
                             jlong str_pointer) {
   req_nnp(env, parser);
   req_nnp(env, str_pointer, "string");
+
   auto *ts_parser_internal = (TSParserInternal *) parser;
-  TSParser *ts_parser = ts_parser_internal->getParser(env);
-  TSTree *old_tree = tree_pointer == 0 ? nullptr : (TSTree *) tree_pointer;
-  auto *source = as_str(env, str_pointer);
 
   if (!ts_parser_internal->begin_round(env)) {
     return 0;
   }
 
+  TSParser *ts_parser = ts_parser_internal->getParser(env);
+
+  if (ts_parser == nullptr) {
+    ts_parser_internal->end_round(env);
+    return 0;
+  }
+
+  TSTree *old_tree =
+      tree_pointer == 0 ? nullptr : (TSTree *) tree_pointer;
+
+  auto *source = as_str(env, str_pointer);
+
+  if (source == nullptr) {
+    ts_parser_internal->end_round(env);
+    return 0;
+  }
+
   auto src_cstring = source->to_cstring();
 
-  // start parsing
-  // if the user cancels the parse while this method is being executed
-  // then this will return nullptr
-  auto tree = ts_parser_parse_string_encoding(ts_parser,
-                                              old_tree,
-                                              src_cstring,
-                                              source->byte_length(),
-                                              TSInputEncodingUTF16);
+  TSTree *tree = ts_parser_parse_string_encoding(
+      ts_parser,
+      old_tree,
+      src_cstring,
+      source->byte_length(),
+      TSInputEncodingUTF16
+  );
 
-  ts_parser_internal->end_round(env);
   delete[] src_cstring;
 
+  ts_parser_internal->end_round(env);
 
   return (jlong) tree;
 }
@@ -270,21 +358,11 @@ TSParser_requestCancellation(
     jclass clazz,
     jlong parser) {
 
+  req_nnp(env, parser, "parser");
+
   auto *parserInternal = (TSParserInternal *) parser;
-  auto flag = parserInternal->get_cancellation_flag(env);
 
-  // no parse is in progress
-  if (flag == nullptr) {
-    LOGD("TSParser",
-         "Cannot cancel parsing, no parse is in progress (cancellation flag is nullptr).");
-    return false;
-  }
-
-  // set the cancellation flag to a non-zero value to indicate that the parse
-  // operation has been cancelled
-  *flag = 1;
-  LOGD("TSParser", "Cancellation flag has been set");
-  return true;
+  return (jboolean) parserInternal->request_cancellation(env);
 }
 
 void TSParser_Native__SetJniMethods(JNINativeMethod *methods, int count) {

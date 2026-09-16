@@ -37,6 +37,7 @@ public class TSParser extends TSNativeObject {
   protected final Condition parseCondition = parseLock.newCondition();
   protected final AtomicBoolean isParsing = new AtomicBoolean(false);
   protected final AtomicBoolean isCancellationRequested = new AtomicBoolean(false);
+  protected volatile boolean isClosed = false;
 
   protected TSParser(long pointer) {
     super(pointer);
@@ -173,8 +174,12 @@ public class TSParser extends TSNativeObject {
    *                                  {@link TSNativeObject#canAccess()} for more details.
    * @throws ParseInProgressException If the parser is currently parsing another syntax tree.
    */
-  public TSTree parseString(TSTree oldTree, UTF16String source) {
+    public TSTree parseString(TSTree oldTree, UTF16String source) {
     checkAccess();
+
+    if (isClosed) {
+      throw new IllegalStateException("TSParser has been closed");
+    }
 
     // Check for reentrancy (same thread calling this method again, before the previous call returned)
     if (parseLock.isHeldByCurrentThread()) {
@@ -185,19 +190,36 @@ public class TSParser extends TSNativeObject {
     // was not requested, throw an error
     throwIfParseNotCancelled();
 
-    // acquire the lock
-    // this will wait until the cancelled parse call returns
     parseLock.lock();
-    setCancellationRequested(false);
-    setParsingFlag();
     try {
-      final var strPointer = source.getNativeObject();
-      final var oldTreePointer = oldTree != null ? oldTree.getNativeObject() : 0;
-      final var tree = Native.parse(this.getNativeObject(), oldTreePointer, strPointer);
-      return createTree(tree);
+      // close() may have started while this thread was waiting for parseLock.
+      if (isClosed) {
+        throw new IllegalStateException("TSParser has been closed");
+      }
+
+      checkAccess();
+
+      setCancellationRequested(false);
+      setParsingFlag();
+
+      final long parserPointer = getNativeObject();
+      final long strPointer = source.getNativeObject();
+      final long oldTreePointer =
+          oldTree != null ? oldTree.getNativeObject() : 0;
+
+      try {
+        final var tree = Native.parse(
+            parserPointer,
+            oldTreePointer,
+            strPointer
+        );
+
+        return createTree(tree);
+      } finally {
+        unsetParsingFlag();
+        parseCondition.signalAll();
+      }
     } finally {
-      unsetParsingFlag();
-      parseCondition.signalAll();
       parseLock.unlock();
     }
   }
@@ -328,6 +350,29 @@ public class TSParser extends TSNativeObject {
   public void reset() {
     checkAccess();
     Native.reset(getNativeObject());
+  }
+  
+    @Override
+  public void close() {
+    if (isClosed) {
+      return;
+    }
+
+    isClosed = true;
+
+    if (isParsing()) {
+      requestCancellationAsync();
+    }
+
+    parseLock.lock();
+    try {
+      if (getNativeObject() != 0) {
+        Native.delete(getNativeObject());
+        setNativeObject(0);
+      }
+    } finally {
+      parseLock.unlock();
+    }
   }
 
   @Override
