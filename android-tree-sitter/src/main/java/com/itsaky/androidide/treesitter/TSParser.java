@@ -26,6 +26,8 @@ import dalvik.annotation.optimization.FastNative;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongFunction;
 
 /**
  * Implementation of tree sitter's <code>TSParser</code> APIs. This implementation always converts
@@ -37,6 +39,14 @@ public class TSParser extends TSNativeObject {
   protected final Condition parseCondition = parseLock.newCondition();
   protected final AtomicBoolean isParsing = new AtomicBoolean(false);
   protected final AtomicBoolean isCancellationRequested = new AtomicBoolean(false);
+  protected volatile boolean isClosed = false;
+
+  /**
+   * Guards the lifetime of the native parser. Every native call holds the read lock, and
+   * {@link #close()} holds the write lock, so the native object cannot be deleted while a call is
+   * in flight.
+   */
+  private final ReentrantReadWriteLock lifetimeLock = new ReentrantReadWriteLock(true);
 
   protected TSParser(long pointer) {
     super(pointer);
@@ -68,8 +78,22 @@ public class TSParser extends TSNativeObject {
    * @see TSLanguage
    */
   public void setLanguage(TSLanguage language) {
-    checkAccess();
-    Native.setLanguage(getNativeObject(), language.getNativeObject());
+    final var languagePointer = language.getNativeObject();
+    withNativeParser(parser -> {
+      Native.setLanguage(parser, languagePointer);
+      return null;
+    });
+  }
+
+  private <T> T withNativeParser(LongFunction<T> action) {
+    final var read = lifetimeLock.readLock();
+    read.lock();
+    try {
+      checkAccess();
+      return action.apply(getNativeObject());
+    } finally {
+      read.unlock();
+    }
   }
 
   /**
@@ -78,8 +102,7 @@ public class TSParser extends TSNativeObject {
    * @return The language instance.
    */
   public TSLanguage getLanguage() {
-    checkAccess();
-    final var langPtr = Native.getLanguage(this.getNativeObject());
+    final var langPtr = withNativeParser(Native::getLanguage);
     if (langPtr == 0) {
       return null;
     }
@@ -174,7 +197,31 @@ public class TSParser extends TSNativeObject {
    * @throws ParseInProgressException If the parser is currently parsing another syntax tree.
    */
   public TSTree parseString(TSTree oldTree, UTF16String source) {
+    final long tree;
+
+    // held for the whole parse so that close() cannot delete the native parser under it
+    final var read = lifetimeLock.readLock();
+    read.lock();
+    try {
+      tree = parseStringLocked(oldTree, source);
+    } finally {
+      read.unlock();
+    }
+
+    /*
+     * createTree() runs the caller supplied TSObjectFactory, which may call back into this
+     * parser. Building the tree outside the read lock keeps a close() from that callback from
+     * deadlocking, since a read lock cannot be upgraded to a write lock.
+     */
+    return createTree(tree);
+  }
+
+  private long parseStringLocked(TSTree oldTree, UTF16String source) {
     checkAccess();
+
+    if (isClosed) {
+      throw new IllegalStateException("TSParser has been closed");
+    }
 
     // Check for reentrancy (same thread calling this method again, before the previous call returned)
     if (parseLock.isHeldByCurrentThread()) {
@@ -185,19 +232,30 @@ public class TSParser extends TSNativeObject {
     // was not requested, throw an error
     throwIfParseNotCancelled();
 
-    // acquire the lock
-    // this will wait until the cancelled parse call returns
     parseLock.lock();
-    setCancellationRequested(false);
-    setParsingFlag();
     try {
-      final var strPointer = source.getNativeObject();
-      final var oldTreePointer = oldTree != null ? oldTree.getNativeObject() : 0;
-      final var tree = Native.parse(this.getNativeObject(), oldTreePointer, strPointer);
-      return createTree(tree);
+      // close() may have started while this thread was waiting for parseLock.
+      if (isClosed) {
+        throw new IllegalStateException("TSParser has been closed");
+      }
+
+      checkAccess();
+
+      setCancellationRequested(false);
+      setParsingFlag();
+
+      try {
+        final long parserPointer = getNativeObject();
+        final long strPointer = source.getNativeObject();
+        final long oldTreePointer =
+            oldTree != null ? oldTree.getNativeObject() : 0;
+
+        return Native.parse(parserPointer, oldTreePointer, strPointer);
+      } finally {
+        unsetParsingFlag();
+        parseCondition.signalAll();
+      }
     } finally {
-      unsetParsingFlag();
-      parseCondition.signalAll();
       parseLock.unlock();
     }
   }
@@ -209,8 +267,10 @@ public class TSParser extends TSNativeObject {
    * <p>If parsing takes longer than this, it will halt early, returning <code>null</code>.
    */
   public void setTimeout(long microseconds) {
-    checkAccess();
-    Native.setTimeout(getNativeObject(), microseconds);
+    withNativeParser(parser -> {
+      Native.setTimeout(parser, microseconds);
+      return null;
+    });
   }
 
   /**
@@ -219,8 +279,7 @@ public class TSParser extends TSNativeObject {
    * @return The timeout in microseconds.
    */
   public long getTimeout() {
-    checkAccess();
-    return Native.getTimeout(getNativeObject());
+    return withNativeParser(Native::getTimeout);
   }
 
   /**
@@ -258,7 +317,7 @@ public class TSParser extends TSNativeObject {
    * otherwise.
    */
   public boolean requestCancellationAsync() {
-    final var requested = Native.requestCancellation(getNativeObject());
+    final boolean requested = withNativeParser(Native::requestCancellation);
     setCancellationRequested(requested);
     return requested;
   }
@@ -308,13 +367,11 @@ public class TSParser extends TSNativeObject {
    * assigned, and this function will return `false`. On success, this function returns `true`
    */
   public boolean setIncludedRanges(TSRange[] ranges) {
-    checkAccess();
-    return Native.setIncludedRanges(getNativeObject(), ranges);
+    return withNativeParser(parser -> Native.setIncludedRanges(parser, ranges));
   }
 
   public TSRange[] getIncludedRanges() {
-    checkAccess();
-    return Native.getIncludedRanges(getNativeObject());
+    return withNativeParser(Native::getIncludedRanges);
   }
 
   /**
@@ -326,8 +383,49 @@ public class TSParser extends TSNativeObject {
    * call this function first.
    */
   public void reset() {
-    checkAccess();
-    Native.reset(getNativeObject());
+    withNativeParser(parser -> {
+      Native.reset(parser);
+      return null;
+    });
+  }
+
+  @Override
+  public void close() {
+    /*
+     * getIncludedRanges() calls the object factory from native code while this thread holds the
+     * read lock, so a close() from such a callback cannot be hoisted out the way parseString()
+     * does it. Fail loudly instead of parking forever on a lock this thread already holds.
+     */
+    if (lifetimeLock.getReadHoldCount() > 0) {
+      throw new IllegalStateException(
+        "close() called from a parser callback, which would deadlock");
+    }
+
+    synchronized (this) {
+      if (isClosed) {
+        return;
+      }
+
+      isClosed = true;
+    }
+
+    // reject a parse which has not reached the native parser yet, and cancel one already running
+    if (getNativeObject() != 0) {
+      Native.beginClose(getNativeObject());
+    }
+
+    final var write = lifetimeLock.writeLock();
+    write.lock();
+    try {
+      parseLock.lock();
+      try {
+        super.close();
+      } finally {
+        parseLock.unlock();
+      }
+    } finally {
+      write.unlock();
+    }
   }
 
   @Override
@@ -376,8 +474,11 @@ public class TSParser extends TSNativeObject {
     @FastNative
     static native long newParser();
 
-    @FastNative
+    /* not FastNative: both block until an active parse finishes, and a FastNative method
+       keeps the thread unsuspendable, which stalls every other thread at the next safepoint */
     static native void delete(long parser);
+
+    static native void beginClose(long parser);
 
     @FastNative
     static native void setLanguage(long parser, long language);
