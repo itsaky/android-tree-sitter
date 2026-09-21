@@ -68,7 +68,7 @@ class TSParserInternal {
     }
 
     // allocate a new cancellation flag
-    flag = (size_t *) malloc(sizeof(int));
+    flag = (size_t *) malloc(sizeof(size_t));
     set_cancellation_flag(env, flag);
 
     // set the cancellation flag to '0' to indicate that the parser should continue parsing
