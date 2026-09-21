@@ -29,8 +29,10 @@
 #include "ts_parser.h"
 
 /**
- * `TSParserInternal` stores the actual tree sitter parser instance along
- * with the cancellation flag and the cancellation flag mutex.
+ * Owns a tree sitter parser and serialises access to its lifecycle.
+ *
+ * A parse round, a cancellation request and a close all hold `lifecycle_mutex`, so the native
+ * parser cannot be destroyed while a parse is still running against it.
  */
 class TSParserInternal {
  public:
@@ -47,7 +49,10 @@ class TSParserInternal {
   }
 
   TSParser *getParser(JNIEnv *env) {
-    if (check_destroyed(env)) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex);
+
+    if (parser == nullptr) {
+      throw_illegal_state(env, "TSParserInternal has already been destroyed");
       return nullptr;
     }
 
@@ -55,7 +60,7 @@ class TSParserInternal {
   }
 
     bool begin_round(JNIEnv *env) {
-    std::unique_lock<std::mutex> lock(cancellation_flag_mutex);
+    std::unique_lock<std::mutex> lock(lifecycle_mutex);
 
     if (parser == nullptr || closing) {
       throw_illegal_state(env, "TSParserInternal has already been closed");
@@ -85,17 +90,14 @@ class TSParserInternal {
   }
 
   void end_round(JNIEnv *env) {
-    std::unique_lock<std::mutex> lock(cancellation_flag_mutex);
+    std::unique_lock<std::mutex> lock(lifecycle_mutex);
 
-    if (parser == nullptr) {
-      return;
-    }
-
-    auto flag = cancellation_flag.load();
-
-    ts_parser_set_cancellation_flag(parser, nullptr);
-    cancellation_flag.store(nullptr);
+    auto flag = cancellation_flag.exchange(nullptr);
     parsing = false;
+
+    if (parser != nullptr) {
+      ts_parser_set_cancellation_flag(parser, nullptr);
+    }
 
     if (flag != nullptr) {
       free(flag);
@@ -106,7 +108,7 @@ class TSParserInternal {
   }
   
   bool request_cancellation(JNIEnv *env) {
-    std::lock_guard<std::mutex> lock(cancellation_flag_mutex);
+    std::lock_guard<std::mutex> lock(lifecycle_mutex);
 
     if (parser == nullptr || closing) {
       return false;
@@ -127,38 +129,24 @@ class TSParserInternal {
     return true;
   }
 
-  size_t *get_cancellation_flag(JNIEnv *env) {
-    if (check_destroyed(env)) {
-      return nullptr;
-    }
-
-    std::lock_guard<std::mutex> get_lock(cancellation_flag_mutex);
-    return cancellation_flag.load();
+  /**
+   * Marks the parser as closing and cancels an active parse, without waiting for it to finish.
+   * Callers which are about to block on the Java side parse lock use this so that a parse which
+   * has not entered `begin_round` yet is rejected instead of running to completion.
+   */
+  void begin_close(JNIEnv *env) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex);
+    request_close_locked();
   }
 
-  void set_cancellation_flag(JNIEnv *env, size_t *flag) {
-    if (check_destroyed(env)) {
-      return;
-    }
-
-    std::lock_guard<std::mutex> set_lock(cancellation_flag_mutex);
-    cancellation_flag.store(flag);
-  } 
-
   void close(JNIEnv *env) {
-    std::unique_lock<std::mutex> lock(cancellation_flag_mutex);
+    std::unique_lock<std::mutex> lock(lifecycle_mutex);
 
     if (parser == nullptr) {
       return;
     }
 
-    closing = true;
-
-    auto flag = cancellation_flag.load();
-
-    if (flag != nullptr) {
-      *flag = 1;
-    }
+    request_close_locked();
 
     parse_condition.wait(lock, [this]() {
       return !parsing;
@@ -166,7 +154,7 @@ class TSParserInternal {
 
     ts_parser_set_cancellation_flag(parser, nullptr);
 
-    flag = cancellation_flag.load();
+    auto flag = cancellation_flag.load();
     cancellation_flag.store(nullptr);
 
     if (flag != nullptr) {
@@ -178,7 +166,21 @@ class TSParserInternal {
   }
 
  private:
-  std::mutex cancellation_flag_mutex;
+  void request_close_locked() {
+    if (parser == nullptr) {
+      return;
+    }
+
+    closing = true;
+
+    auto flag = cancellation_flag.load();
+
+    if (flag != nullptr) {
+      *flag = 1;
+    }
+  }
+
+  std::mutex lifecycle_mutex;
   std::atomic<size_t *> cancellation_flag{nullptr};
   std::condition_variable parse_condition;
   bool parsing = false;
@@ -186,14 +188,6 @@ class TSParserInternal {
 
   TSParser *parser;
 
-  bool check_destroyed(JNIEnv *env) {
-    if (cancellation_flag.load() == nullptr && parser == nullptr) {
-      throw_illegal_state(env, "TSParserInternal has already been destroyed");
-      return true;
-    }
-
-    return false;
-  }
 };
 
 static jlong
@@ -212,6 +206,16 @@ TSParser_delete(JNIEnv *env,
   auto parser = (TSParserInternal *) parser_ptr;
 
   parser->close(env);
+  delete parser;
+}
+
+static void
+TSParser_beginClose(JNIEnv *env,
+                    jclass self,
+                    jlong parser_ptr) {
+  req_nnp(env, parser_ptr);
+
+  ((TSParserInternal *) parser_ptr)->begin_close(env);
 }
 
 static void
@@ -368,6 +372,7 @@ TSParser_requestCancellation(
 void TSParser_Native__SetJniMethods(JNINativeMethod *methods, int count) {
   SET_JNI_METHOD(methods, TSParser_Native_newParser, TSParser_newParser);
   SET_JNI_METHOD(methods, TSParser_Native_delete, TSParser_delete);
+  SET_JNI_METHOD(methods, TSParser_Native_beginClose, TSParser_beginClose);
   SET_JNI_METHOD(methods, TSParser_Native_setLanguage, TSParser_setLanguage);
   SET_JNI_METHOD(methods, TSParser_Native_getLanguage, TSParser_getLanguage);
   SET_JNI_METHOD(methods, TSParser_Native_reset, TSParser_reset);
