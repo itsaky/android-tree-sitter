@@ -36,6 +36,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.junit.After;
 import org.junit.Before;
@@ -314,30 +315,60 @@ public class ParserTest extends TreeSitterTest {
 
   @Test
   public void testParserCancellation() {
-    try (TSParser parser = TSParser.create()) {
+    try (final var parser = TSParser.create();
+         final var source = UTF16StringFactory.newString()) {
       parser.setLanguage(TSLanguageJava.getInstance());
 
-      final var executor = Executors.newScheduledThreadPool(2);
-      final var parseFuture = executor.schedule(() -> {
+      // a single copy parses in well under a second on a fast machine, which is not long enough
+      // to reliably cancel; repeating it keeps the parse running while the cancellation lands
+      final var fileContent = readResource("View.java.txt");
+      for (int i = 0; i < 8; i++) {
+        source.append(fileContent);
+      }
 
-        // cancel the parsing after 200ms
-        executor.schedule(() -> assertThat(parser.requestCancellationAsync()).isTrue(), 200,
-          TimeUnit.MILLISECONDS);
+      final var parseReturned = new AtomicBoolean(false);
+      final var executor = Executors.newFixedThreadPool(2);
 
-        // parsing the View.java.txt file takes 300-600ms
-        try (var tree = parser.parseString(readResource("View.java.txt"))) {
+      final var cancelFuture = executor.submit(() -> {
+        while (!parser.isParsing()) {
+          failIfParseReturned(parseReturned);
+          Thread.onSpinWait();
+        }
+
+        // isParsing() is set before the native parse starts, so the cancellation flag may not
+        // exist yet; retry until the request is accepted
+        while (!parser.requestCancellationAsync()) {
+          failIfParseReturned(parseReturned);
+          Thread.onSpinWait();
+        }
+
+        return null;
+      });
+
+      final var parseFuture = executor.submit(() -> {
+        try (final var tree = parser.parseString(source)) {
           // if the parsing is cancelled, then the tree must be null
           assertThat(tree).isNull();
+        } finally {
+          parseReturned.set(true);
         }
-      }, 0, TimeUnit.MICROSECONDS);
+        return null;
+      });
 
       try {
-        parseFuture.get();
-      } catch (InterruptedException | ExecutionException e) {
+        parseFuture.get(60, TimeUnit.SECONDS);
+        cancelFuture.get(60, TimeUnit.SECONDS);
+      } catch (Exception e) {
         throw new RuntimeException(e);
       } finally {
         executor.shutdownNow();
       }
+    }
+  }
+
+  private static void failIfParseReturned(AtomicBoolean parseReturned) {
+    if (parseReturned.get()) {
+      throw new AssertionError("Parse returned before the cancellation could be requested");
     }
   }
 
